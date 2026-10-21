@@ -1,0 +1,88 @@
+"""Registo de personagens (requisito 3.2).
+
+Uso:  python criar_personagem.py
+
+Pede o login do jogador, cria a personagem na base de dados e mostra a ficha
+completa (nome, classe, nível, XP, vida, energia, dinheiro, estatísticas e data
+de criação). Cada utilizador só pode ter uma personagem.
+"""
+import getpass
+
+from database.connection import get_connection, init_db
+from exceptions import BerserkError
+from services import authentication as auth
+from services import characters
+from ui import messages as msg
+
+
+def ask_int(prompt, low, high):
+    """Pede um inteiro até ser válido (nunca termina por input errado)."""
+    while True:
+        try:
+            value = int(input(prompt).strip())
+        except ValueError:
+            print("Introduz um número inteiro válido.")
+            continue
+        if low <= value <= high:
+            return value
+        print(f"Escolhe um valor entre {low} e {high}.")
+
+
+def login(conn):
+    while True:
+        try:
+            return auth.login(conn, input("Username: "), getpass.getpass("Palavra-passe: "))
+        except BerserkError as err:
+            print(f"! {err}")
+            if ask_int("Tentar de novo? (1=sim, 0=sair): ", 0, 1) == 0:
+                return None
+
+
+def choose_class(conn):
+    classes = characters.list_classes(conn)
+    print("\nClasses disponíveis:")
+    for n, c in enumerate(classes, 1):
+        skills = conn.execute("SELECT nome FROM habilidades WHERE classe = ? ORDER BY nivel_min",
+                              (c["nome"],)).fetchall()
+        print(f"  {n}) {c['nome']}: vida {c['vida']}, ataque {c['ataque']}, defesa {c['defesa']}, "
+              f"energia {c['energia']}  |  habilidades: {', '.join(s['nome'] for s in skills)}")
+    return classes[ask_int("Classe: ", 1, len(classes)) - 1]["nome"]
+
+
+def register_character(conn, user):
+    existing = characters.get_character_by_user(conn, user["id"])
+    if existing:
+        print(f"\nJá tens uma personagem: {existing['nome']}.")
+        return existing
+    while True:
+        try:
+            name = input("\nNome da personagem: ")
+            class_name = choose_class(conn)
+            char = characters.create_character(conn, user["id"], name, class_name)
+            print(f"\nPersonagem criada com {char['dinheiro']} moedas iniciais!")
+            return char
+        except BerserkError as err:
+            print(f"! {err}")
+            if ask_int("Tentar de novo? (1=sim, 0=sair): ", 0, 1) == 0:
+                return None
+
+
+def main():
+    conn = get_connection()
+    try:
+        init_db(conn)
+        print("=== Berserk: registo de personagem ===")
+        user = login(conn)
+        if user is None:
+            return
+        char = register_character(conn, user)
+        if char:
+            print(msg.character_sheet(char, characters.effective_stats(conn, char["id"])))
+    except (KeyboardInterrupt, EOFError):
+        print("\nOperação cancelada.")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
