@@ -1,0 +1,28 @@
+"""Histórico de atividades (3.8)."""
+from datetime import datetime
+
+
+def log(conn, user_id, action, description, character_id=None):
+    """Regista uma ação. Não faz commit: faz parte da transação do chamador."""
+    conn.execute(
+        "INSERT INTO logs (utilizador_id, personagem_id, acao, descricao) VALUES (?, ?, ?, ?)",
+        (user_id, character_id, action, description),
+    )
+
+
+def get_history(conn, user_id, limit=30):
+    """Devolve linhas formatadas '21/09/2026 10:32 — João comprou Poção de Vida'."""
+    rows = conn.execute(
+        """SELECT l.data, COALESCE(p.nome, u.username) AS autor, l.descricao
+           FROM logs l
+           JOIN utilizadores u ON u.id = l.utilizador_id
+           LEFT JOIN personagens p ON p.id = l.personagem_id
+           WHERE l.utilizador_id = ?
+           ORDER BY l.id DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    lines = []
+    for r in rows:
+        when = datetime.strptime(r["data"], "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y %H:%M")
+        lines.append(f"{when} — {r['autor']} {r['descricao']}")
+    return lines
