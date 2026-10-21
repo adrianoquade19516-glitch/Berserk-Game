@@ -1,0 +1,92 @@
+"""Missões (3.5)."""
+import config
+from exceptions import GameRuleError, NotFoundError
+from services import characters, history
+
+
+def list_missions(conn, char_id):
+    """Todas as missões com o estado e progresso desta personagem."""
+    return conn.execute(
+        """SELECT m.*, a.nome AS alvo,
+                  COALESCE(pm.estado, 'disponivel') AS estado,
+                  COALESCE(pm.progresso, 0) AS progresso
+           FROM missoes m
+           JOIN adversarios a ON a.id = m.adversario_id
+           LEFT JOIN personagem_missoes pm ON pm.missao_id = m.id AND pm.personagem_id = ?
+           ORDER BY m.xp""",
+        (char_id,),
+    ).fetchall()
+
+
+def accept(conn, char_id, mission_id):
+    char = characters.get_character(conn, char_id)
+    mission = conn.execute("SELECT * FROM missoes WHERE id = ?", (mission_id,)).fetchone()
+    if mission is None:
+        raise NotFoundError("Missão inexistente.")
+    current = conn.execute("SELECT estado FROM personagem_missoes WHERE personagem_id = ? AND missao_id = ?",
+                           (char_id, mission_id)).fetchone()
+    if current and current["estado"] == "em_curso":
+        raise GameRuleError("Essa missão já está em curso.")
+    if current and current["estado"] == "concluida":
+        raise GameRuleError("Essa missão já foi concluída.")
+    active = conn.execute("SELECT COUNT(*) AS n FROM personagem_missoes WHERE personagem_id = ? AND estado = 'em_curso'",
+                          (char_id,)).fetchone()["n"]
+    if active >= config.MAX_ACTIVE_MISSIONS:
+        raise GameRuleError(f"Só podes ter {config.MAX_ACTIVE_MISSIONS} missões em curso ao mesmo tempo.")
+    with conn:
+        if current:   # falhada -> volta a tentar
+            conn.execute(
+                """UPDATE personagem_missoes SET estado = 'em_curso', progresso = 0,
+                          data_inicio = datetime('now','localtime'), data_fim = NULL
+                   WHERE personagem_id = ? AND missao_id = ?""", (char_id, mission_id))
+        else:
+            conn.execute("INSERT INTO personagem_missoes (personagem_id, missao_id, estado) VALUES (?, ?, 'em_curso')",
+                         (char_id, mission_id))
+        history.log(conn, char["utilizador_id"], "missao", f"aceitou a missão {mission['nome']}", char_id)
+
+
+def on_enemy_defeated(conn, char_id, enemy_id):
+    """Avança as missões em curso cujo alvo é este adversário. Devolve mensagens."""
+    char = characters.get_character(conn, char_id)
+    rows = conn.execute(
+        """SELECT pm.missao_id, pm.progresso, m.nome, m.quantidade, m.dinheiro, m.xp
+           FROM personagem_missoes pm JOIN missoes m ON m.id = pm.missao_id
+           WHERE pm.personagem_id = ? AND pm.estado = 'em_curso' AND m.adversario_id = ?""",
+        (char_id, enemy_id),
+    ).fetchall()
+    messages = []
+    for r in rows:
+        progress = r["progresso"] + 1
+        if progress >= r["quantidade"]:
+            conn.execute(
+                """UPDATE personagem_missoes SET estado = 'concluida', progresso = ?,
+                          data_fim = datetime('now','localtime')
+                   WHERE personagem_id = ? AND missao_id = ?""", (progress, char_id, r["missao_id"]))
+            conn.execute("UPDATE personagens SET dinheiro = dinheiro + ? WHERE id = ?", (r["dinheiro"], char_id))
+            characters.add_xp(conn, char_id, r["xp"])
+            history.log(conn, char["utilizador_id"], "missao",
+                        f"concluiu a missão {r['nome']} (+{r['dinheiro']} moedas, +{r['xp']} XP)", char_id)
+            messages.append(f"Missão concluída: {r['nome']}! +{r['dinheiro']} moedas, +{r['xp']} XP.")
+        else:
+            conn.execute("UPDATE personagem_missoes SET progresso = ? WHERE personagem_id = ? AND missao_id = ?",
+                         (progress, char_id, r["missao_id"]))
+            messages.append(f"Missão {r['nome']}: {progress}/{r['quantidade']}.")
+    return messages
+
+
+def on_player_defeated(conn, char_id, enemy_id):
+    """A personagem perdeu contra o alvo de uma missão em curso: a missão falha."""
+    char = characters.get_character(conn, char_id)
+    rows = conn.execute(
+        """SELECT pm.missao_id, m.nome FROM personagem_missoes pm JOIN missoes m ON m.id = pm.missao_id
+           WHERE pm.personagem_id = ? AND pm.estado = 'em_curso' AND m.adversario_id = ?""",
+        (char_id, enemy_id),
+    ).fetchall()
+    messages = []
+    for r in rows:
+        conn.execute(
+            """UPDATE personagem_missoes SET estado = 'falhada', data_fim = datetime('now','localtime')
+               WHERE personagem_id = ? AND missao_id = ?""", (char_id, r["missao_id"]))
+        history.log(conn, char["utilizador_id"], "missao", f"falhou a missão {r['nome']}", char_id)
+        messages.append(f"Missão falhada: {r['nome']}.")
+    return messages
