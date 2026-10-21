@@ -1,0 +1,42 @@
+"""Validação de dados introduzidos (3.1 e requisitos de qualidade)."""
+import re
+
+from exceptions import ValidationError
+
+_USERNAME = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_CHAR_NAME = re.compile(r"^[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9 '\-]{2,19}$")
+
+
+def validate_username(value):
+    value = (value or "").strip()
+    if not _USERNAME.match(value):
+        raise ValidationError("Username inválido: 3 a 20 caracteres (letras, números ou _).")
+    return value
+
+
+def validate_email(value):
+    value = (value or "").strip()
+    if not _EMAIL.match(value):
+        raise ValidationError("Email inválido.")
+    return value
+
+
+def validate_password(value):
+    value = value or ""
+    if len(value) < 8 or not any(c.isalpha() for c in value) or not any(c.isdigit() for c in value):
+        raise ValidationError("A palavra-passe deve ter pelo menos 8 caracteres, com letras e números.")
+    return value
+
+
+def validate_character_name(value):
+    value = (value or "").strip()
+    if not _CHAR_NAME.match(value):
+        raise ValidationError("Nome de personagem inválido: 3 a 20 caracteres (letras, números, espaços, ' ou -).")
+    return value
+
+
+def validate_quantity(value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValidationError("A quantidade deve ser um inteiro positivo.")
+    return value
