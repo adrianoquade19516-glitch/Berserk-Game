@@ -1,0 +1,162 @@
+"""Sistema de combate por turnos (3.6)."""
+import math
+import random
+
+import config
+from exceptions import GameRuleError, NotFoundError
+from services import characters, history, missions
+
+
+def _round(value):
+    return max(1, math.floor(value + 0.5))
+
+
+def list_enemies(conn):
+    return conn.execute("SELECT * FROM adversarios ORDER BY nivel, nome").fetchall()
+
+
+class CombatSession:
+    """Um combate. O jogador age (atacar / habilidade / fugir) e o adversário responde.
+
+    Regras (jogo.md, secção 6): dano base = máx(1, ataque − defesa/2); sorte ×0,9–1,1;
+    crítico do adversário ×1,5 (jogador 5%); a personagem ataca primeiro.
+    """
+
+    def __init__(self, conn, char_id, enemy_id, rng=None):
+        self.conn, self.rng = conn, rng or random.Random()
+        char = characters.get_character(conn, char_id)
+        enemy = conn.execute("SELECT * FROM adversarios WHERE id = ?", (enemy_id,)).fetchone()
+        if enemy is None:
+            raise NotFoundError("Adversário inexistente.")
+        if char["vida"] < config.MIN_LIFE_TO_FIGHT * char["vida_max"]:
+            raise GameRuleError("Precisas de pelo menos 30% da vida máxima para combater.")
+        if char["energia"] < config.COMBAT_ENERGY_COST:
+            raise GameRuleError("Precisas de pelo menos 10 de energia para combater.")
+        stats = characters.effective_stats(conn, char_id)
+        self.char, self.enemy = char, enemy
+        self.attack, self.defense = stats["ataque"], stats["defesa"]
+        self.player_hp, self.enemy_hp = char["vida"], enemy["vida"]
+        self.energy = char["energia"] - config.COMBAT_ENERGY_COST
+        self.skills = characters.available_skills(conn, char)
+        self.atk_buff_turns = self.def_buff_turns = 0
+        self.atk_buff_bonus = self.def_buff_bonus = 0.0
+        self.turns, self.finished, self.result = 0, False, None
+        with conn:
+            conn.execute("UPDATE personagens SET energia = ? WHERE id = ?", (self.energy, char_id))
+            history.log(conn, char["utilizador_id"], "combate", f"iniciou combate contra {enemy['nome']}", char_id)
+
+    # ---------- turno do jogador ----------
+    def player_turn(self, action="attack", skill_id=None):
+        """action: 'attack' | 'skill' | 'flee'. Devolve as mensagens do turno."""
+        if self.finished:
+            raise GameRuleError("O combate já terminou.")
+        msgs = []
+        if action == "flee":
+            if self.rng.random() < self.enemy["prob_fuga"]:
+                msgs.append("Conseguiste fugir!")
+                self.turns += 1
+                self._finish("fuga", msgs)
+                return msgs
+            msgs.append("Tentaste fugir mas falhaste e perdeste o turno!")
+        elif action == "skill":
+            self._use_skill(skill_id, msgs)
+        else:
+            self._strike(msgs, "Atacas")
+        self.turns += 1
+        if self.enemy_hp <= 0:
+            self._finish("vitoria", msgs)
+            return msgs
+        self._enemy_attack(msgs)
+        if self.player_hp <= 0:
+            self._finish("derrota", msgs)
+        return msgs
+
+    def _hit(self, multiplier=1.0, ignore_defense=0.0):
+        attack = self.attack * (1 + self.atk_buff_bonus if self.atk_buff_turns > 0 else 1)
+        defense = self.enemy["defesa"] * (1 - ignore_defense)
+        damage = max(1, attack - defense / 2) * multiplier * self.rng.uniform(0.9, 1.1)
+        crit = self.rng.random() < config.PLAYER_CRIT_CHANCE
+        if crit:
+            damage *= config.CRIT_MULTIPLIER
+        return _round(damage), crit
+
+    def _strike(self, msgs, label, multiplier=1.0, shots=1, ignore_defense=0.0):
+        for _ in range(shots):
+            damage, crit = self._hit(multiplier, ignore_defense)
+            self.enemy_hp = max(0, self.enemy_hp - damage)
+            msgs.append(f"{label}: {damage} de dano{' (CRÍTICO!)' if crit else ''}.")
+        if self.atk_buff_turns > 0:
+            self.atk_buff_turns -= 1
+
+    def _use_skill(self, skill_id, msgs):
+        skill = next((s for s in self.skills if s["id"] == skill_id), None)
+        if skill is None:
+            raise GameRuleError("Habilidade indisponível.")
+        if self.energy < skill["custo_energia"]:
+            raise GameRuleError("Energia insuficiente para essa habilidade; usa o ataque normal.")
+        self.energy -= skill["custo_energia"]
+        self.conn.execute("UPDATE personagens SET energia = ? WHERE id = ?", (self.energy, self.char["id"]))
+        self.conn.commit()
+        if skill["efeito"] == "dano":
+            self._strike(msgs, skill["nome"], skill["multiplicador"], skill["disparos"], skill["ignora_defesa"])
+        elif skill["efeito"] == "buff_ataque":
+            self.atk_buff_turns, self.atk_buff_bonus = skill["duracao"], skill["bonus"]
+            msgs.append(f"{skill['nome']}: ataque +{int(skill['bonus'] * 100)}% durante {skill['duracao']} turnos.")
+        else:
+            self.def_buff_turns, self.def_buff_bonus = skill["duracao"], skill["bonus"]
+            msgs.append(f"{skill['nome']}: defesa x{1 + skill['bonus']:g} durante {skill['duracao']} turnos.")
+
+    # ---------- turno do adversário ----------
+    def _enemy_attack(self, msgs):
+        defense = self.defense * (1 + self.def_buff_bonus if self.def_buff_turns > 0 else 1)
+        damage = max(1, self.enemy["ataque"] - defense / 2) * self.rng.uniform(0.9, 1.1)
+        crit = self.rng.random() < self.enemy["prob_critico"]
+        if crit:
+            damage *= config.CRIT_MULTIPLIER
+        damage = _round(damage)
+        self.player_hp = max(0, self.player_hp - damage)
+        msgs.append(f"{self.enemy['nome']} ataca: {damage} de dano{' (CRÍTICO!)' if crit else ''}.")
+        if self.def_buff_turns > 0:
+            self.def_buff_turns -= 1
+
+    # ---------- fim do combate ----------
+    def _finish(self, outcome, msgs):
+        conn, char, enemy = self.conn, self.char, self.enemy
+        result = {"resultado": outcome, "xp": 0, "dinheiro": 0, "niveis": [], "missoes": []}
+        with conn:
+            if outcome == "vitoria":
+                result.update(xp=enemy["xp"], dinheiro=enemy["dinheiro"])
+                conn.execute(
+                    """UPDATE personagens SET vida = ?, energia = ?, dinheiro = dinheiro + ?,
+                              vitorias = vitorias + 1 WHERE id = ?""",
+                    (self.player_hp, self.energy, enemy["dinheiro"], char["id"]))
+                history.log(conn, char["utilizador_id"], "combate", f"venceu o combate contra {enemy['nome']}", char["id"])
+                history.log(conn, char["utilizador_id"], "recompensa",
+                            f"recebeu {enemy['xp']} XP e {enemy['dinheiro']} moedas", char["id"])
+                result["niveis"] = characters.add_xp(conn, char["id"], enemy["xp"])
+                result["missoes"] = missions.on_enemy_defeated(conn, char["id"], enemy["id"])
+                msgs.append(f"Venceste! +{enemy['xp']} XP e +{enemy['dinheiro']} moedas.")
+                for lvl in result["niveis"]:
+                    msgs.append(f"Subiste para o nível {lvl}!")
+                msgs.extend(result["missoes"])
+            elif outcome == "derrota":
+                money = characters.get_character(conn, char["id"])["dinheiro"]
+                loss = int(money * config.DEFEAT_MONEY_LOSS)
+                result["dinheiro"] = -loss
+                conn.execute(
+                    """UPDATE personagens SET vida = 1, energia = ?, dinheiro = dinheiro - ?,
+                              derrotas = derrotas + 1 WHERE id = ?""",
+                    (self.energy, loss, char["id"]))
+                history.log(conn, char["utilizador_id"], "combate",
+                            f"foi derrotado por {enemy['nome']} e perdeu {loss} moedas", char["id"])
+                result["missoes"] = missions.on_player_defeated(conn, char["id"], enemy["id"])
+                msgs.append(f"Foste derrotado! Perdeste {loss} moedas.")
+                msgs.extend(result["missoes"])
+            else:  # fuga: sem ganhos nem perdas, além da energia gasta
+                conn.execute("UPDATE personagens SET energia = ? WHERE id = ?", (self.energy, char["id"]))
+                history.log(conn, char["utilizador_id"], "combate", f"fugiu do combate contra {enemy['nome']}", char["id"])
+            conn.execute(
+                """INSERT INTO combates (personagem_id, adversario_id, resultado, turnos, xp_ganho, dinheiro_delta)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (char["id"], enemy["id"], outcome, self.turns, result["xp"], result["dinheiro"]))
+        self.finished, self.result = True, result
