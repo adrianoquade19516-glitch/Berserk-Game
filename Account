@@ -1,0 +1,273 @@
+"""Gestão de contas de utilizador (requisito 3.1).
+
+Funcionalidades:
+  - Registar novos utilizadores
+  - Iniciar sessão / Terminar sessão
+  - Alterar dados da conta (username e email)
+  - Alterar palavra-passe
+  - Impedir usernames duplicados
+  - Validar os dados introduzidos
+  - Dois tipos de utilizador: jogador e administrador
+  - Palavras-passe guardadas com hash (PBKDF2-HMAC-SHA256 + salt), nunca em texto simples
+
+Este ficheiro é autónomo (só usa a biblioteca padrão do Python).
+Para experimentar:  python database/account.py
+"""
+import getpass
+import hashlib
+import hmac
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+# ----------------------------------------------------------------- configuração
+DB_PATH = os.environ.get("BERSERK_DB", str(Path(__file__).resolve().parent.parent / "berserk.db"))
+ITERACOES = 200_000
+
+JOGADOR = "jogador"
+ADMINISTRADOR = "administrador"
+
+
+# ------------------------------------------------------------------- exceções
+class ContaError(Exception):
+    """Erro base: a mensagem pode ser mostrada ao utilizador."""
+
+
+class ValidacaoError(ContaError):
+    """Dados introduzidos inválidos."""
+
+
+class AutenticacaoError(ContaError):
+    """Credenciais erradas, conta bloqueada ou sem permissões."""
+
+
+# --------------------------------------------------------------- base de dados
+def get_connection(path=None):
+    conn = sqlite3.connect(path or DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def criar_tabela(conn):
+    """Cria a tabela de utilizadores (igual à do database.sql)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS utilizadores (
+               id            INTEGER PRIMARY KEY AUTOINCREMENT,
+               username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+               email         TEXT NOT NULL,
+               password_hash TEXT NOT NULL,
+               papel         TEXT NOT NULL DEFAULT 'jogador'
+                             CHECK (papel IN ('jogador','administrador')),
+               bloqueado     INTEGER NOT NULL DEFAULT 0 CHECK (bloqueado IN (0,1)),
+               data_criacao  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+           )"""
+    )
+    conn.commit()
+
+
+# ------------------------------------------------------------------ validação
+_USERNAME = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def validar_username(valor):
+    valor = (valor or "").strip()
+    if not _USERNAME.match(valor):
+        raise ValidacaoError("Username inválido: 3 a 20 caracteres (letras, números ou _).")
+    return valor
+
+
+def validar_email(valor):
+    valor = (valor or "").strip()
+    if not _EMAIL.match(valor):
+        raise ValidacaoError("Email inválido.")
+    return valor
+
+
+def validar_password(valor):
+    valor = valor or ""
+    if len(valor) < 8 or not any(c.isalpha() for c in valor) or not any(c.isdigit() for c in valor):
+        raise ValidacaoError("A palavra-passe deve ter pelo menos 8 caracteres, com letras e números.")
+    return valor
+
+
+# -------------------------------------------------------------------- hashing
+def gerar_hash(password):
+    """Devolve 'iterações$salt$hash' (salt aleatório de 16 bytes)."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERACOES)
+    return f"{ITERACOES}${salt.hex()}${digest.hex()}"
+
+
+def verificar_password(password, guardado):
+    try:
+        iteracoes, salt_hex, hash_hex = guardado.split("$")
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(iteracoes))
+    except ValueError:
+        return False
+    return hmac.compare_digest(digest.hex(), hash_hex)
+
+
+# ------------------------------------------------------------------- operações
+def obter_utilizador(conn, user_id):
+    return conn.execute("SELECT * FROM utilizadores WHERE id = ?", (user_id,)).fetchone()
+
+
+def _inserir(conn, username, email, password, papel):
+    username = validar_username(username)
+    email = validar_email(email)
+    validar_password(password)
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO utilizadores (username, email, password_hash, papel) VALUES (?, ?, ?, ?)",
+                (username, email, gerar_hash(password), papel),
+            )
+    except sqlite3.IntegrityError:          # UNIQUE no username
+        raise ValidacaoError("Esse username já existe.") from None
+    return obter_utilizador(conn, cur.lastrowid)
+
+
+def registar(conn, username, email, password):
+    """Registo público: cria sempre um JOGADOR."""
+    return _inserir(conn, username, email, password, JOGADOR)
+
+
+def criar_administrador(conn, username, email, password):
+    """Cria um administrador. Chamar só por código/script de confiança,
+    nunca a partir do registo público."""
+    return _inserir(conn, username, email, password, ADMINISTRADOR)
+
+
+def iniciar_sessao(conn, username, password):
+    """Devolve o utilizador se as credenciais forem válidas."""
+    user = conn.execute("SELECT * FROM utilizadores WHERE username = ?",
+                        ((username or "").strip(),)).fetchone()
+    if user is None or not verificar_password(password or "", user["password_hash"]):
+        raise AutenticacaoError("Username ou palavra-passe incorretos.")
+    if user["bloqueado"]:
+        raise AutenticacaoError("Esta conta está bloqueada.")
+    return user
+
+
+def terminar_sessao(sessao):
+    """Termina a sessão (limpa o utilizador atual)."""
+    sessao.utilizador = None
+
+
+def alterar_dados(conn, user_id, username=None, email=None):
+    """Altera username e/ou email. Campos vazios mantêm o valor atual."""
+    user = obter_utilizador(conn, user_id)
+    novo_username = validar_username(username) if username else user["username"]
+    novo_email = validar_email(email) if email else user["email"]
+    try:
+        with conn:
+            conn.execute("UPDATE utilizadores SET username = ?, email = ? WHERE id = ?",
+                         (novo_username, novo_email, user_id))
+    except sqlite3.IntegrityError:
+        raise ValidacaoError("Esse username já existe.") from None
+    return obter_utilizador(conn, user_id)
+
+
+def alterar_password(conn, user_id, password_atual, password_nova):
+    user = obter_utilizador(conn, user_id)
+    if not verificar_password(password_atual or "", user["password_hash"]):
+        raise AutenticacaoError("A palavra-passe atual está incorreta.")
+    validar_password(password_nova)
+    with conn:
+        conn.execute("UPDATE utilizadores SET password_hash = ? WHERE id = ?",
+                     (gerar_hash(password_nova), user_id))
+
+
+# ------------------------------------------------------------------ permissões
+def e_administrador(user):
+    return user is not None and user["papel"] == ADMINISTRADOR
+
+
+def exigir_administrador(user):
+    """Usar no início de qualquer operação reservada a administradores."""
+    if not e_administrador(user):
+        raise AutenticacaoError("Operação reservada a administradores.")
+
+
+class Sessao:
+    """Guarda o utilizador que tem sessão iniciada."""
+
+    def __init__(self):
+        self.utilizador = None
+
+    @property
+    def ativa(self):
+        return self.utilizador is not None
+
+
+# ------------------------------------------------------------ menu de consola
+def _pedir_opcao(prompt, minimo, maximo):
+    while True:
+        try:
+            valor = int(input(prompt).strip())
+        except ValueError:
+            print("Introduz um número inteiro válido.")
+            continue
+        if minimo <= valor <= maximo:
+            return valor
+        print(f"Escolhe um valor entre {minimo} e {maximo}.")
+
+
+def _menu_conta(conn, sessao):
+    while sessao.ativa:
+        u = sessao.utilizador
+        print(f"\n--- Conta: {u['username']} ({u['papel']}) ---")
+        print("1) Alterar dados  2) Alterar palavra-passe  0) Terminar sessão")
+        opcao = _pedir_opcao("> ", 0, 2)
+        try:
+            if opcao == 1:
+                sessao.utilizador = alterar_dados(
+                    conn, u["id"],
+                    input("Novo username (vazio = manter): ").strip() or None,
+                    input("Novo email (vazio = manter): ").strip() or None)
+                print("Dados atualizados.")
+            elif opcao == 2:
+                alterar_password(conn, u["id"], getpass.getpass("Palavra-passe atual: "),
+                                 getpass.getpass("Nova palavra-passe: "))
+                print("Palavra-passe alterada.")
+            else:
+                terminar_sessao(sessao)
+                print("Sessão terminada.")
+        except ContaError as erro:
+            print(f"! {erro}")
+
+
+def main():
+    conn = get_connection()
+    criar_tabela(conn)
+    sessao = Sessao()
+    try:
+        while True:
+            print("\n=== Berserk: contas ===\n1) Registar\n2) Iniciar sessão\n0) Sair")
+            opcao = _pedir_opcao("> ", 0, 2)
+            if opcao == 0:
+                break
+            try:
+                if opcao == 1:
+                    registar(conn, input("Username: "), input("Email: "),
+                             getpass.getpass("Palavra-passe: "))
+                    print("Conta criada! Já podes iniciar sessão.")
+                else:
+                    sessao.utilizador = iniciar_sessao(conn, input("Username: "),
+                                                       getpass.getpass("Palavra-passe: "))
+                    print(f"Bem-vindo, {sessao.utilizador['username']}!")
+                    _menu_conta(conn, sessao)
+            except ContaError as erro:
+                print(f"! {erro}")
+    except (KeyboardInterrupt, EOFError):
+        print("\nPrograma terminado.")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
