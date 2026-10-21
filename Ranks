@@ -1,0 +1,26 @@
+"""Ranking de jogadores (3.7): nível, depois XP, depois vitórias."""
+
+_ORDER = "p.nivel DESC, p.xp DESC, p.vitorias DESC, p.id ASC"
+
+
+def get_ranking(conn, limit=10):
+    return conn.execute(
+        f"""SELECT ROW_NUMBER() OVER (ORDER BY {_ORDER}) AS posicao,
+                   p.nome, p.classe, p.nivel, p.xp, p.vitorias
+            FROM personagens p ORDER BY {_ORDER} LIMIT ?""",
+        (limit,),
+    ).fetchall()
+
+
+def get_position(conn, char_id):
+    """Posição da personagem e total de jogadores, ou None."""
+    row = conn.execute(
+        f"""SELECT posicao FROM (
+                SELECT p.id, ROW_NUMBER() OVER (ORDER BY {_ORDER}) AS posicao FROM personagens p)
+            WHERE id = ?""",
+        (char_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    total = conn.execute("SELECT COUNT(*) AS n FROM personagens").fetchone()["n"]
+    return row["posicao"], total
