@@ -1,0 +1,120 @@
+"""Loja, inventário e economia (3.3 e 3.4)."""
+import config
+from exceptions import GameRuleError, NotFoundError
+from services import characters, history, validation
+
+
+def list_items(conn):
+    return conn.execute("SELECT * FROM itens ORDER BY preco, nome").fetchall()
+
+
+def _get_item(conn, item_id):
+    item = conn.execute("SELECT * FROM itens WHERE id = ?", (item_id,)).fetchone()
+    if item is None:
+        raise NotFoundError("Item inexistente.")
+    return item
+
+
+def get_inventory(conn, char_id):
+    return conn.execute(
+        """SELECT i.*, inv.quantidade, inv.equipado
+           FROM inventario inv JOIN itens i ON i.id = inv.item_id
+           WHERE inv.personagem_id = ? ORDER BY i.tipo, i.nome""",
+        (char_id,),
+    ).fetchall()
+
+
+def _record_transaction(conn, char_id, item_id, kind, qty, unit_price, before, after):
+    conn.execute(
+        """INSERT INTO transacoes (personagem_id, item_id, tipo, quantidade, preco_unitario,
+                                   saldo_anterior, saldo_atual) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (char_id, item_id, kind, qty, unit_price, before, after),
+    )
+
+
+def buy(conn, char_id, item_id, qty=1):
+    qty = validation.validate_quantity(qty)
+    item, char = _get_item(conn, item_id), characters.get_character(conn, char_id)
+    total = item["preco"] * qty
+    if item["stock"] < qty:
+        raise GameRuleError(f"Stock insuficiente (disponível: {item['stock']}).")
+    if char["dinheiro"] < total:
+        raise GameRuleError(f"Dinheiro insuficiente: precisas de {total}, tens {char['dinheiro']}.")
+    after = char["dinheiro"] - total
+    with conn:
+        conn.execute("UPDATE itens SET stock = stock - ? WHERE id = ?", (qty, item_id))
+        conn.execute("UPDATE personagens SET dinheiro = ? WHERE id = ?", (after, char_id))
+        conn.execute(
+            """INSERT INTO inventario (personagem_id, item_id, quantidade) VALUES (?, ?, ?)
+               ON CONFLICT(personagem_id, item_id) DO UPDATE SET quantidade = quantidade + excluded.quantidade""",
+            (char_id, item_id, qty),
+        )
+        _record_transaction(conn, char_id, item_id, "compra", qty, item["preco"], char["dinheiro"], after)
+        history.log(conn, char["utilizador_id"], "compra", f"comprou {qty}x {item['nome']}", char_id)
+    return {"item": item["nome"], "total": total, "saldo_anterior": char["dinheiro"], "saldo_atual": after}
+
+
+def sell(conn, char_id, item_id, qty=1):
+    qty = validation.validate_quantity(qty)
+    item, char = _get_item(conn, item_id), characters.get_character(conn, char_id)
+    owned = conn.execute("SELECT quantidade FROM inventario WHERE personagem_id = ? AND item_id = ?",
+                         (char_id, item_id)).fetchone()
+    if owned is None or owned["quantidade"] < qty:
+        raise GameRuleError("Não tens essa quantidade desse item.")
+    unit = int(item["preco"] * config.SELL_RATIO)
+    total = unit * qty
+    after = char["dinheiro"] + total
+    with conn:
+        if owned["quantidade"] == qty:
+            conn.execute("DELETE FROM inventario WHERE personagem_id = ? AND item_id = ?", (char_id, item_id))
+        else:
+            conn.execute("UPDATE inventario SET quantidade = quantidade - ? WHERE personagem_id = ? AND item_id = ?",
+                         (qty, char_id, item_id))
+        conn.execute("UPDATE itens SET stock = stock + ? WHERE id = ?", (qty, item_id))
+        conn.execute("UPDATE personagens SET dinheiro = ? WHERE id = ?", (after, char_id))
+        _record_transaction(conn, char_id, item_id, "venda", qty, unit, char["dinheiro"], after)
+        history.log(conn, char["utilizador_id"], "venda", f"vendeu {qty}x {item['nome']} por {total} moedas", char_id)
+    return {"item": item["nome"], "total": total, "saldo_anterior": char["dinheiro"], "saldo_atual": after}
+
+
+def use_item(conn, char_id, item_id):
+    """Usa uma poção (consumida). Só Poção de Vida e Elixir de Energia têm efeito."""
+    item, char = _get_item(conn, item_id), characters.get_character(conn, char_id)
+    if item["cura"] <= 0 and item["energia_restaurada"] <= 0:
+        raise GameRuleError(f"{item['nome']} não pode ser usado.")
+    owned = conn.execute("SELECT quantidade FROM inventario WHERE personagem_id = ? AND item_id = ?",
+                         (char_id, item_id)).fetchone()
+    if owned is None:
+        raise GameRuleError("Não tens esse item.")
+    new_life = min(char["vida_max"], char["vida"] + item["cura"])
+    new_energy = min(char["energia_max"], char["energia"] + item["energia_restaurada"])
+    if new_life == char["vida"] and new_energy == char["energia"]:
+        raise GameRuleError("Não precisas de usar este item agora.")
+    with conn:
+        conn.execute("UPDATE personagens SET vida = ?, energia = ? WHERE id = ?", (new_life, new_energy, char_id))
+        if owned["quantidade"] == 1:
+            conn.execute("DELETE FROM inventario WHERE personagem_id = ? AND item_id = ?", (char_id, item_id))
+        else:
+            conn.execute("UPDATE inventario SET quantidade = quantidade - 1 WHERE personagem_id = ? AND item_id = ?",
+                         (char_id, item_id))
+        history.log(conn, char["utilizador_id"], "usar", f"usou {item['nome']}", char_id)
+    return characters.get_character(conn, char_id)
+
+
+def equip(conn, char_id, item_id):
+    """Equipa uma arma ou armadura (máx. 1 de cada tipo)."""
+    item, char = _get_item(conn, item_id), characters.get_character(conn, char_id)
+    if item["tipo"] not in ("arma", "armadura"):
+        raise GameRuleError("Só armas e armaduras se equipam.")
+    if conn.execute("SELECT 1 FROM inventario WHERE personagem_id = ? AND item_id = ?",
+                    (char_id, item_id)).fetchone() is None:
+        raise GameRuleError("Não tens esse item.")
+    with conn:
+        conn.execute(
+            """UPDATE inventario SET equipado = 0 WHERE personagem_id = ?
+               AND item_id IN (SELECT id FROM itens WHERE tipo = ?)""",
+            (char_id, item["tipo"]),
+        )
+        conn.execute("UPDATE inventario SET equipado = 1 WHERE personagem_id = ? AND item_id = ?",
+                     (char_id, item_id))
+        history.log(conn, char["utilizador_id"], "equipar", f"equipou {item['nome']}", char_id)
